@@ -1,0 +1,22 @@
+{
+  "name": "monti-it-clauger",
+  "owner": {
+    "name": "monti-it",
+    "url": "https://github.com/monti-it"
+  },
+  "description": "Claude Code skills for Clauger's Azure DevOps workflow (MyClauger-Evolution).",
+  "plugins": [
+    {
+      "name": "m3i-clauger",
+      "source": "./plugins/m3i-clauger",
+      "description": "process-work-item (one ADO work item from ticket to PR, then a background SonarCloud follow-up), sonar-pr (fix or justify the SonarCloud findings on an ADO PR), story-to-feature (promote an oversized User Story to a Feature and split it into child stories).",
+      "category": "productivity",
+      "keywords": [
+        "skills",
+        "azure-devops",
+        "sonarcloud",
+        "workflow"
+      ]
+    }
+  ]
+}

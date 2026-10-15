@@ -1,0 +1,5 @@
+# never commit a PAT, even if one lands in this folder
+ado_pat.txt
+*.pat
+*.token
+.env
