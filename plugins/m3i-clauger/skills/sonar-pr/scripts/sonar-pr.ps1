@@ -65,235 +65,260 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-function Fail($msg) {
-  Write-Error $msg
-  exit 1
-}
+# Authenticated access to the Azure DevOps REST API of one org/project/repo.
+class AdoClient {
+  [string]$Org
+  [string]$Project
+  [string]$RepoName
+  hidden [hashtable]$Headers
 
-# --- auth -------------------------------------------------------------------
-$patFile = if ($env:ADO_PAT_FILE) { $env:ADO_PAT_FILE } else { Join-Path $env:TEMP 'ado_pat.txt' }
-if (-not (Test-Path $patFile)) {
-  Fail "PAT file not found: $patFile`nEither connect an Azure DevOps MCP server (no PAT needed), or create the file with:`nSet-Content -Path `"$patFile`" -Value `"YOUR_PAT`" -NoNewline"
-}
-$pat = (Get-Content -Raw -Path $patFile).Trim()
-if (-not $pat) { Fail "PAT file is empty: $patFile" }
-$headers = @{ Authorization = 'Basic ' + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$pat")) }
+  AdoClient([string]$repoOverride) {
+    $this.Org = if ($env:ADO_ORG_URL) { $env:ADO_ORG_URL.TrimEnd('/') } else { 'https://dev.azure.com/clauger3e' }
+    $this.Project = if ($env:ADO_PROJECT) { $env:ADO_PROJECT } else { 'MyClauger-Evolution' }
+    $this.Headers = @{ Authorization = 'Basic ' + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$([AdoClient]::ReadPat())")) }
+    $this.RepoName = [AdoClient]::ResolveRepoName($repoOverride)
+  }
 
-# --- config ---------------------------------------------------------------
-$org = if ($env:ADO_ORG_URL) { $env:ADO_ORG_URL.TrimEnd('/') } else { 'https://dev.azure.com/clauger3e' }
-$project = if ($env:ADO_PROJECT) { $env:ADO_PROJECT } else { 'MyClauger-Evolution' }
+  [object] Get([string]$uri) {
+    return $this.Invoke('GET', $uri, $null)
+  }
 
-function Get-RepoName {
-  if ($env:ADO_REPO) { return $env:ADO_REPO }
-  if ($Repo) { return $Repo }
-  $url = (& git remote get-url origin 2>$null)
-  if ($LASTEXITCODE -eq 0 -and $url) {
-    return ($url -replace '\.git$', '' -split '/')[-1]
+  [object] Post([string]$uri, [object]$body) {
+    return $this.Invoke('POST', $uri, $body)
   }
-  Fail 'Could not determine repository name; pass -Repo or set $env:ADO_REPO.'
-}
 
-function Invoke-Ado {
-  param(
-    [string]$Method,
-    [string]$Uri,
-    [object]$Body
-  )
-  $params = @{
-    Method      = $Method
-    Uri         = $Uri
-    Headers     = $headers
-    ContentType = 'application/json; charset=utf-8'
-  }
-  if ($null -ne $Body) {
-    # Sent as UTF-8 bytes so accented text survives.
-    $params.Body = [Text.Encoding]::UTF8.GetBytes(($Body | ConvertTo-Json -Depth 20))
-  }
-  try {
-    return Invoke-RestMethod @params
-  }
-  catch {
-    $resp = $_.Exception.Response
-    $detail = ''
-    if ($resp) {
-      try {
-        $reader = New-Object IO.StreamReader($resp.GetResponseStream())
-        $detail = $reader.ReadToEnd()
-      }
-      catch { }
+  hidden [object] Invoke([string]$method, [string]$uri, [object]$body) {
+    $params = @{
+      Method      = $method
+      Uri         = $uri
+      Headers     = $this.Headers
+      ContentType = 'application/json; charset=utf-8'
     }
-    Fail "ADO API $Method $Uri failed: $($_.Exception.Message)`n$detail"
-  }
-}
-
-$repoName = Get-RepoName
-$prBase = "$org/$project/_apis/git/repositories/$repoName/pullRequests/$PrId"
-$replyMarker = 'sonar-pr: issue'
-
-# A gate status this long after the build started is the real analysis; the
-# earlier one (~1-2 min after start) is SonarCloud's placeholder "passed".
-$realGateDelay = [timespan]::FromMinutes(4)
-
-function ConvertTo-Utc($value) {
-  if ($null -eq $value) { return $null }
-  if ($value -is [datetime]) { return $value.ToUniversalTime() }
-  ([datetimeoffset]::Parse($value, [Globalization.CultureInfo]::InvariantCulture)).UtcDateTime
-}
-
-function Get-Status {
-  $pr = Invoke-Ado -Method GET -Uri "$prBase`?api-version=7.1"
-  $iterations = (Invoke-Ado -Method GET -Uri "$prBase/iterations?api-version=7.1").value
-  $lastIteration = if ($iterations) { [int]($iterations | Measure-Object -Property id -Maximum).Maximum } else { $null }
-
-  $mergeCommit = if ($pr.PSObject.Properties['lastMergeCommit'] -and $pr.lastMergeCommit) { $pr.lastMergeCommit.commitId } else { $null }
-
-  # The build validation policy evaluation carries the PR build state with the
-  # PR's own permissions (the builds API would need a Build-scoped PAT).
-  $artifactId = "vstfs:///CodeReview/CodeReviewId/$($pr.repository.project.id)/$PrId"
-  $evaluations = (Invoke-Ado -Method GET -Uri ("$org/$project/_apis/policy/evaluations?artifactId=" +
-      [uri]::EscapeDataString($artifactId) + '&api-version=7.1-preview.1')).value
-  $build = @($evaluations | Where-Object { $_.configuration.type.displayName -eq 'Build' }) | Select-Object -First 1
-  $buildCtx = if ($build -and $build.PSObject.Properties['context'] -and $build.context) { $build.context } else { $null }
-  $buildStarted = if ($buildCtx -and $buildCtx.PSObject.Properties['buildStartedUtc']) { ConvertTo-Utc $buildCtx.buildStartedUtc } else { $null }
-  $buildCurrent = [bool]($buildCtx -and $mergeCommit -and $buildCtx.lastMergeCommitId -eq $mergeCommit -and -not $buildCtx.buildIsNotCurrent)
-
-  $statuses = (Invoke-Ado -Method GET -Uri "$prBase/statuses?api-version=7.1").value
-  $gates = @($statuses | Where-Object {
-      $_.context.genre -eq 'SonarCloud' -and $_.context.name -like '*quality gate*' -and
-      $_.PSObject.Properties['iterationId'] -and $_.iterationId -eq $lastIteration
-    } | Sort-Object { ConvertTo-Utc $_.creationDate } -Descending)
-  $gate = if ($gates.Count) { $gates[0] } else { $null }
-  $gateCreated = if ($gate) { ConvertTo-Utc $gate.creationDate } else { $null }
-
-  $ready = $false
-  $reason =
-  if ($pr.status -ne 'active') { "PR is $($pr.status)" }
-  elseif (-not $build) { 'no build validation policy evaluation on this PR' }
-  elseif (-not $buildCurrent) { 'the build is not for the current merge commit yet' }
-  elseif ($build.status -eq 'rejected') { 'build failed' }
-  elseif ($build.status -ne 'approved') { "build is $($build.status)" }
-  elseif (-not $gate) { "no SonarCloud quality gate status for iteration $lastIteration yet" }
-  elseif ($buildStarted -and $gateCreated -lt $buildStarted + $realGateDelay) { 'only the early placeholder quality gate status so far' }
-  else { $ready = $true; 'build completed and SonarCloud analysis posted' }
-
-  [ordered]@{
-    ready       = $ready
-    reason      = $reason
-    pr          = [ordered]@{
-      id           = $pr.pullRequestId
-      status       = $pr.status
-      sourceBranch = $pr.sourceRefName -replace '^refs/heads/', ''
-      targetBranch = $pr.targetRefName -replace '^refs/heads/', ''
-      mergeCommit  = $mergeCommit
-      iteration    = $lastIteration
+    if ($null -ne $body) {
+      # Sent as UTF-8 bytes so accented text survives.
+      $params.Body = [Text.Encoding]::UTF8.GetBytes(($body | ConvertTo-Json -Depth 20))
     }
-    build       = if ($build) {
-      [ordered]@{
-        id         = if ($buildCtx -and $buildCtx.PSObject.Properties['buildId']) { $buildCtx.buildId } else { $null }
-        status     = $build.status
-        startedUtc = $buildStarted
-        current    = $buildCurrent
+    try {
+      return Invoke-RestMethod @params
+    }
+    catch {
+      $detail = ''
+      $resp = $_.Exception.Response
+      if ($resp) {
+        try { $detail = (New-Object IO.StreamReader($resp.GetResponseStream())).ReadToEnd() } catch { }
       }
-    } else { $null }
-    qualityGate = if ($gate) {
-      [ordered]@{
-        state       = $gate.state
-        description = if ($gate.PSObject.Properties['description']) { $gate.description } else { $null }
-        iterationId = $gate.iterationId
-        createdUtc  = $gateCreated
-        url         = if ($gate.PSObject.Properties['targetUrl']) { $gate.targetUrl } else { $null }
-      }
-    } else { $null }
-  }
-}
-
-function Get-LiveComments($thread) {
-  if (-not $thread.PSObject.Properties['comments']) { return @() }
-  @($thread.comments | Where-Object { -not ($_.PSObject.Properties['isDeleted'] -and $_.isDeleted) -and $_.content })
-}
-
-function Get-RepliedKeys($threads) {
-  $keys = @{}
-  foreach ($t in $threads) {
-    foreach ($c in (Get-LiveComments $t)) {
-      foreach ($m in [regex]::Matches($c.content, [regex]::Escape($replyMarker) + '\s+`?([^\s`]+)')) {
-        $keys[$m.Groups[1].Value] = $true
-      }
+      throw "ADO API $method $uri failed: $($_.Exception.Message)`n$detail"
     }
   }
-  $keys
+
+  hidden static [string] ReadPat() {
+    $patFile = if ($env:ADO_PAT_FILE) { $env:ADO_PAT_FILE } else { Join-Path $env:TEMP 'ado_pat.txt' }
+    if (-not (Test-Path $patFile)) {
+      throw "PAT file not found: $patFile`nEither connect an Azure DevOps MCP server (no PAT needed), or create the file with:`nSet-Content -Path `"$patFile`" -Value `"YOUR_PAT`" -NoNewline"
+    }
+    $pat = (Get-Content -Raw -Path $patFile).Trim()
+    if (-not $pat) { throw "PAT file is empty: $patFile" }
+    return $pat
+  }
+
+  hidden static [string] ResolveRepoName([string]$repoOverride) {
+    if ($env:ADO_REPO) { return $env:ADO_REPO }
+    if ($repoOverride) { return $repoOverride }
+    $url = (& git remote get-url origin 2>$null)
+    if ($LASTEXITCODE -eq 0 -and $url) {
+      return ($url -replace '\.git$', '' -split '/')[-1]
+    }
+    throw 'Could not determine repository name; pass -Repo or set $env:ADO_REPO.'
+  }
 }
 
-function Get-SonarThreads {
-  $threads = @((Invoke-Ado -Method GET -Uri "$prBase/threads?api-version=7.1").value)
-  $replied = Get-RepliedKeys $threads
-  $byKey = [ordered]@{}
-  foreach ($t in ($threads | Sort-Object { [datetime]$_.publishedDate })) {
-    $first = (Get-LiveComments $t) | Select-Object -First 1
-    if (-not $first) { continue }
-    $text = $first.content
-    $key = [regex]::Match($text, '\[ISSUE_KEY\]:\s*(\S+)')
-    if (-not $key.Success -or $text -notmatch '\[PROJECT_KEY\]:') { continue }
-    $url = [regex]::Match($text, '\[See it in SonarQube Cloud\]\((https://sonarcloud\.io/\S+?)\)')
-    # The markers alone are easy to imitate in a human comment; require the
-    # SonarCloud issue link too.
-    if (-not $url.Success) { continue }
-    $rule = [regex]::Match($text, '\(\[([\w.-]+:[\w.-]+)\]')
-    $ctx = if ($t.PSObject.Properties['threadContext'] -and $t.threadContext) { $t.threadContext } else { $null }
-    $byKey[$key.Groups[1].Value] = [ordered]@{
-      threadId = $t.id
-      status   = $t.status
-      filePath = if ($ctx) { $ctx.filePath } else { $null }
-      line     = if ($ctx -and $ctx.PSObject.Properties['rightFileStart'] -and $ctx.rightFileStart) { $ctx.rightFileStart.line } else { $null }
-      issueKey = $key.Groups[1].Value
-      rule     = if ($rule.Success) { $rule.Groups[1].Value } else { $null }
-      message  = (($text -split '\(\[', 2)[0]).Trim()
-      url      = $url.Groups[1].Value
-      replied  = $replied.ContainsKey($key.Groups[1].Value)
+# The SonarCloud side of one pull request: readiness, threads, replies.
+class SonarPr {
+  static [string]$ReplyMarker = 'sonar-pr: issue'
+
+  # A gate status this long after the build started is the real analysis; the
+  # earlier one (~1-2 min after start) is SonarCloud's placeholder "passed".
+  static [timespan]$RealGateDelay = [timespan]::FromMinutes(4)
+
+  hidden [AdoClient]$Ado
+  hidden [int]$PrId
+  hidden [string]$PrBase
+
+  SonarPr([AdoClient]$ado, [int]$prId) {
+    $this.Ado = $ado
+    $this.PrId = $prId
+    $this.PrBase = "$($ado.Org)/$($ado.Project)/_apis/git/repositories/$($ado.RepoName)/pullRequests/$prId"
+  }
+
+  [Collections.Specialized.OrderedDictionary] GetStatus() {
+    $pr = $this.Ado.Get("$($this.PrBase)?api-version=7.1")
+    $iterations = $this.Ado.Get("$($this.PrBase)/iterations?api-version=7.1").value
+    $lastIteration = if ($iterations) { [int]($iterations | Measure-Object -Property id -Maximum).Maximum } else { $null }
+
+    $mergeCommit = if ($pr.PSObject.Properties['lastMergeCommit'] -and $pr.lastMergeCommit) { $pr.lastMergeCommit.commitId } else { $null }
+
+    # The build validation policy evaluation carries the PR build state with the
+    # PR's own permissions (the builds API would need a Build-scoped PAT).
+    $artifactId = "vstfs:///CodeReview/CodeReviewId/$($pr.repository.project.id)/$($this.PrId)"
+    $evaluations = $this.Ado.Get("$($this.Ado.Org)/$($this.Ado.Project)/_apis/policy/evaluations?artifactId=" +
+      [uri]::EscapeDataString($artifactId) + '&api-version=7.1-preview.1').value
+    $build = @($evaluations | Where-Object { $_.configuration.type.displayName -eq 'Build' }) | Select-Object -First 1
+    $buildCtx = if ($build -and $build.PSObject.Properties['context'] -and $build.context) { $build.context } else { $null }
+    $buildStarted = if ($buildCtx -and $buildCtx.PSObject.Properties['buildStartedUtc']) { [SonarPr]::ToUtc($buildCtx.buildStartedUtc) } else { $null }
+    $buildCurrent = [bool]($buildCtx -and $mergeCommit -and $buildCtx.lastMergeCommitId -eq $mergeCommit -and -not $buildCtx.buildIsNotCurrent)
+
+    $statuses = $this.Ado.Get("$($this.PrBase)/statuses?api-version=7.1").value
+    $gates = @($statuses | Where-Object {
+        $_.context.genre -eq 'SonarCloud' -and $_.context.name -like '*quality gate*' -and
+        $_.PSObject.Properties['iterationId'] -and $_.iterationId -eq $lastIteration
+      } | Sort-Object { [SonarPr]::ToUtc($_.creationDate) } -Descending)
+    $gate = if ($gates.Count) { $gates[0] } else { $null }
+    $gateCreated = if ($gate) { [SonarPr]::ToUtc($gate.creationDate) } else { $null }
+
+    $ready = $false
+    $reason =
+    if ($pr.status -ne 'active') { "PR is $($pr.status)" }
+    elseif (-not $build) { 'no build validation policy evaluation on this PR' }
+    elseif (-not $buildCurrent) { 'the build is not for the current merge commit yet' }
+    elseif ($build.status -eq 'rejected') { 'build failed' }
+    elseif ($build.status -ne 'approved') { "build is $($build.status)" }
+    elseif (-not $gate) { "no SonarCloud quality gate status for iteration $lastIteration yet" }
+    elseif ($buildStarted -and $gateCreated -lt $buildStarted + [SonarPr]::RealGateDelay) { 'only the early placeholder quality gate status so far' }
+    else { $ready = $true; 'build completed and SonarCloud analysis posted' }
+
+    return [ordered]@{
+      ready       = $ready
+      reason      = $reason
+      pr          = [ordered]@{
+        id           = $pr.pullRequestId
+        status       = $pr.status
+        sourceBranch = $pr.sourceRefName -replace '^refs/heads/', ''
+        targetBranch = $pr.targetRefName -replace '^refs/heads/', ''
+        mergeCommit  = $mergeCommit
+        iteration    = $lastIteration
+      }
+      build       = if ($build) {
+        [ordered]@{
+          id         = if ($buildCtx -and $buildCtx.PSObject.Properties['buildId']) { $buildCtx.buildId } else { $null }
+          status     = $build.status
+          startedUtc = $buildStarted
+          current    = $buildCurrent
+        }
+      } else { $null }
+      qualityGate = if ($gate) {
+        [ordered]@{
+          state       = $gate.state
+          description = if ($gate.PSObject.Properties['description']) { $gate.description } else { $null }
+          iterationId = $gate.iterationId
+          createdUtc  = $gateCreated
+          url         = if ($gate.PSObject.Properties['targetUrl']) { $gate.targetUrl } else { $null }
+        }
+      } else { $null }
     }
   }
-  @($byKey.Values)
-}
 
-switch ($Command) {
-
-  'status' {
-    Get-Status | ConvertTo-Json -Depth 10
-  }
-
-  'wait' {
-    $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
+  [Collections.Specialized.OrderedDictionary] Wait([int]$timeoutMinutes, [int]$intervalSeconds) {
+    $deadline = (Get-Date).AddMinutes($timeoutMinutes)
     while ($true) {
-      $s = Get-Status
-      if ($s.ready -or $s.pr.status -ne 'active' -or $s.reason -eq 'build failed' -or (Get-Date) -ge $deadline) { break }
-      Start-Sleep -Seconds $IntervalSeconds
+      $s = $this.GetStatus()
+      if ($s.ready -or $s.pr.status -ne 'active' -or $s.reason -eq 'build failed' -or (Get-Date) -ge $deadline) {
+        $s['timedOut'] = -not $s.ready -and $s.pr.status -eq 'active' -and $s.reason -ne 'build failed'
+        return $s
+      }
+      Start-Sleep -Seconds $intervalSeconds
     }
-    $s['timedOut'] = -not $s.ready -and $s.pr.status -eq 'active' -and $s.reason -ne 'build failed'
-    $s | ConvertTo-Json -Depth 10
+    return $null # unreachable; PowerShell classes need a return on every path
   }
 
-  'threads' {
-    ConvertTo-Json -InputObject @(Get-SonarThreads) -Depth 10
+  [object[]] GetThreads() {
+    $threads = $this.FetchThreads()
+    $replied = [SonarPr]::RepliedKeys($threads)
+    $byKey = [ordered]@{}
+    foreach ($t in ($threads | Sort-Object { [datetime]$_.publishedDate })) {
+      $first = [SonarPr]::LiveComments($t) | Select-Object -First 1
+      if (-not $first) { continue }
+      $text = $first.content
+      $key = [regex]::Match($text, '\[ISSUE_KEY\]:\s*(\S+)')
+      if (-not $key.Success -or $text -notmatch '\[PROJECT_KEY\]:') { continue }
+      $url = [regex]::Match($text, '\[See it in SonarQube Cloud\]\((https://sonarcloud\.io/\S+?)\)')
+      # The markers alone are easy to imitate in a human comment; require the
+      # SonarCloud issue link too.
+      if (-not $url.Success) { continue }
+      $rule = [regex]::Match($text, '\(\[([\w.-]+:[\w.-]+)\]')
+      $ctx = if ($t.PSObject.Properties['threadContext'] -and $t.threadContext) { $t.threadContext } else { $null }
+      $byKey[$key.Groups[1].Value] = [ordered]@{
+        threadId = $t.id
+        status   = $t.status
+        filePath = if ($ctx) { $ctx.filePath } else { $null }
+        line     = if ($ctx -and $ctx.PSObject.Properties['rightFileStart'] -and $ctx.rightFileStart) { $ctx.rightFileStart.line } else { $null }
+        issueKey = $key.Groups[1].Value
+        rule     = if ($rule.Success) { $rule.Groups[1].Value } else { $null }
+        message  = (($text -split '\(\[', 2)[0]).Trim()
+        url      = $url.Groups[1].Value
+        replied  = $replied.ContainsKey($key.Groups[1].Value)
+      }
+    }
+    return @($byKey.Values)
   }
 
-  'reply' {
-    if (-not $ThreadId) { Fail 'reply needs -ThreadId.' }
-    if (-not $IssueKey) { Fail 'reply needs -IssueKey.' }
-    if (-not $Content) { Fail 'reply needs -Content.' }
-    $threads = @((Invoke-Ado -Method GET -Uri "$prBase/threads?api-version=7.1").value)
-    if ((Get-RepliedKeys $threads).ContainsKey($IssueKey)) {
-      [ordered]@{ posted = $false; reason = "a sonar-pr reply for $IssueKey already exists" } | ConvertTo-Json
-      break
+  [Collections.Specialized.OrderedDictionary] Reply([int]$threadId, [string]$issueKey, [string]$content) {
+    if (-not $threadId) { throw 'reply needs -ThreadId.' }
+    if (-not $issueKey) { throw 'reply needs -IssueKey.' }
+    if (-not $content) { throw 'reply needs -Content.' }
+    $threads = $this.FetchThreads()
+    if ([SonarPr]::RepliedKeys($threads).ContainsKey($issueKey)) {
+      return [ordered]@{ posted = $false; reason = "a sonar-pr reply for $issueKey already exists" }
     }
-    $thread = $threads | Where-Object { $_.id -eq $ThreadId } | Select-Object -First 1
-    if (-not $thread) { Fail "Thread $ThreadId not found on PR $PrId." }
-    $root = (Get-LiveComments $thread) | Select-Object -First 1
+    $thread = $threads | Where-Object { $_.id -eq $threadId } | Select-Object -First 1
+    if (-not $thread) { throw "Thread $threadId not found on PR $($this.PrId)." }
+    $root = [SonarPr]::LiveComments($thread) | Select-Object -First 1
     $body = @{
       parentCommentId = if ($root) { $root.id } else { 0 }
-      content         = "$Content`n`n_$replyMarker ``$IssueKey``_"
+      content         = "$content`n`n_$([SonarPr]::ReplyMarker) ``$issueKey``_"
       commentType     = 1
     }
-    $c = Invoke-Ado -Method POST -Uri "$prBase/threads/$ThreadId/comments?api-version=7.1" -Body $body
-    [ordered]@{ posted = $true; threadId = $ThreadId; commentId = $c.id } | ConvertTo-Json
+    $c = $this.Ado.Post("$($this.PrBase)/threads/$threadId/comments?api-version=7.1", $body)
+    return [ordered]@{ posted = $true; threadId = $threadId; commentId = $c.id }
   }
+
+  hidden [object[]] FetchThreads() {
+    return @($this.Ado.Get("$($this.PrBase)/threads?api-version=7.1").value)
+  }
+
+  hidden static [object[]] LiveComments([object]$thread) {
+    if (-not $thread.PSObject.Properties['comments']) { return @() }
+    return @($thread.comments | Where-Object { -not ($_.PSObject.Properties['isDeleted'] -and $_.isDeleted) -and $_.content })
+  }
+
+  hidden static [hashtable] RepliedKeys([object[]]$threads) {
+    $keys = @{}
+    foreach ($t in $threads) {
+      foreach ($c in [SonarPr]::LiveComments($t)) {
+        foreach ($m in [regex]::Matches($c.content, [regex]::Escape([SonarPr]::ReplyMarker) + '\s+`?([^\s`]+)')) {
+          $keys[$m.Groups[1].Value] = $true
+        }
+      }
+    }
+    return $keys
+  }
+
+  hidden static [object] ToUtc([object]$value) {
+    if ($null -eq $value) { return $null }
+    if ($value -is [datetime]) { return $value.ToUniversalTime() }
+    return ([datetimeoffset]::Parse($value, [Globalization.CultureInfo]::InvariantCulture)).UtcDateTime
+  }
+}
+
+try {
+  $sonar = [SonarPr]::new([AdoClient]::new($Repo), $PrId)
+  switch ($Command) {
+    'status' { $sonar.GetStatus() | ConvertTo-Json -Depth 10 }
+    'wait' { $sonar.Wait($TimeoutMinutes, $IntervalSeconds) | ConvertTo-Json -Depth 10 }
+    'threads' { ConvertTo-Json -InputObject @($sonar.GetThreads()) -Depth 10 }
+    'reply' { $sonar.Reply($ThreadId, $IssueKey, $Content) | ConvertTo-Json }
+  }
+}
+catch {
+  Write-Error $_.Exception.Message -ErrorAction Continue
+  exit 1
 }

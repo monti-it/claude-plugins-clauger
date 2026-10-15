@@ -1,6 +1,6 @@
 {
   "name": "m3i-clauger",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Clauger's Azure DevOps workflow: process-work-item, sonar-pr, story-to-feature.",
   "author": {
     "name": "monti-it",
