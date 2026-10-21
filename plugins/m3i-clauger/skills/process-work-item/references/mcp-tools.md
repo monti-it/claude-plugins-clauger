@@ -107,7 +107,8 @@ version.
 Prefer `ado.ps1 create-pr` whenever a PAT is available. The PR must be created
 **with squash auto-complete and delete-source-branch enabled, and
 `transitionWorkItems` off**, which the script does in the same step (POST the PR,
-then PATCH `autoCompleteSetBy` + `completionOptions`). Most MCP servers only
+then PATCH `autoCompleteSetBy` + `completionOptions`, including the web UI's
+`Merged PR <id>: <title>` squash message). Most MCP servers only
 create the PR.
 
 Use the MCP tool only when there is no PAT at all. Then:
@@ -124,7 +125,10 @@ Use the MCP tool only when there is no PAT at all. Then:
   (`repo_update_pull_request` or similar) if it exposes those fields, passing
   `transitionWorkItems` = false when the schema has it - "complete associated work
   items after merging" must stay off, since the skill owns the state and stops at
-  `PR Done`. If it does not, tell the user auto-complete is **not** set and they
+  `PR Done`. Also pass `mergeCommitMessage` when the schema has it, built like
+  the web UI's default: `Merged PR <id>: <title>`, blank line, description, blank
+  line, `Related work items: #<id>`; otherwise the server writes
+  `Merge pull request <id> from <source> into <target>`. If it does not, tell the user auto-complete is **not** set and they
   can enable it in the ADO UI, leaving that box unticked - do not leave that
   silent.
 

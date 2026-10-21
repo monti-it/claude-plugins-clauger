@@ -183,7 +183,8 @@ pwsh <skill>/scripts/ado.ps1 create-pr -Source <branch> -Target release/X.Y `
 ```
 
 It turns on **auto-complete** with a **squash** merge and delete-source-branch, so
-the PR merges itself once policies pass. It also sets
+the PR merges itself once policies pass, with the web UI's squash message
+(`Merged PR <id>: <title>` + description + `Related work items`). It also sets
 `completionOptions.transitionWorkItems` = **false** ("complete associated work
 items after merging" unticked): the skill owns the work item state, so the merge
 must not move it past `PR Done`.
@@ -192,8 +193,9 @@ Only when no PAT is available: create the PR with
 `<prefix>repo_create_pull_request` (repo name from `git remote get-url origin`,
 source `<branch>`, target `release/X.Y`, title, description; pass the work item id
 if the schema has a parameter for it). Then set auto-complete through the server's
-PR update tool if it has one, with `transitionWorkItems` false where the schema
-exposes it - and if it does not, say plainly that auto-complete is **not** enabled
+PR update tool if it has one, with `transitionWorkItems` false and
+`mergeCommitMessage` = `Merged PR <id>: <title>` (+ description + `Related work
+items: #<id>`) where the schema exposes them - and if it does not, say plainly that auto-complete is **not** enabled
 and the user can switch it on in the ADO UI, leaving "complete associated work
 items after merging" unticked.
 

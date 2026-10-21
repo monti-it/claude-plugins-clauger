@@ -73,6 +73,11 @@
 - Auto-complete is enabled on creation with **squash** merge strategy and
   delete-source-branch (`ado.ps1 create-pr` PATCHes `autoCompleteSetBy` +
   `completionOptions` right after creating the PR). Do not merge it by hand.
+- The squash commit message is the one the ADO web UI pre-fills -
+  `Merged PR <id>: <title>`, blank line, the description, blank line,
+  `Related work items: #<id>` - sent as `completionOptions.mergeCommitMessage`.
+  Without it, a server-side auto-complete writes
+  `Merge pull request <id> from <source> into <target>` instead.
 - **"Complete associated work items after merging" is off** -
   `completionOptions.transitionWorkItems = false`. The skill owns the work item
   state and leaves it at `PR Done`; the merge must not transition it further.

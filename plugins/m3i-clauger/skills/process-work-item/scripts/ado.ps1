@@ -20,7 +20,8 @@
     create-pr      -Source <branch> -Target <branch> -Title <string>
                    -Description <string> [-WorkItemId <n>] [-Repo <name>]
                    (also enables auto-complete with a squash merge +
-                    delete source branch, and turns "complete associated work
+                    delete source branch, the web UI's "Merged PR <id>: <title>"
+                    commit message, and turns "complete associated work
                     items after merging" off)
 
   Work item states: only New, Active and PR Done may ever be written. -State is
@@ -239,10 +240,16 @@ switch ($Command) {
     # Enable auto-complete with a squash merge (set by the PR creator).
     $autoComplete = $false
     if ($pr.createdBy.id) {
+      # Same squash message the ADO web UI pre-fills; without it the server falls
+      # back to "Merge pull request <id> from <source> into <target>".
+      $mergeMessage = "Merged PR $($pr.pullRequestId): $Title"
+      if ($Description) { $mergeMessage += "`n`n$Description" }
+      if ($WorkItemId) { $mergeMessage += "`n`nRelated work items: #$WorkItemId" }
       $patch = @{
         autoCompleteSetBy = @{ id = $pr.createdBy.id }
         completionOptions = @{
           mergeStrategy       = 'squash'
+          mergeCommitMessage  = $mergeMessage
           deleteSourceBranch  = $true
           # "Complete associated work items after merging": off. The skill owns
           # the work item state (New / Active / PR Done) and must not let the
